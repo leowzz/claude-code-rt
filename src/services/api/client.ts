@@ -1,6 +1,12 @@
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk'
 import { randomUUID } from 'crypto'
 import type { GoogleAuth } from 'google-auth-library'
+import type {
+  BetaMessage,
+  BetaMessageStreamParams,
+  BetaRawMessageStreamEvent,
+} from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import type { Stream } from '@anthropic-ai/sdk/streaming.mjs'
 import {
   checkAndRefreshOAuthTokenIfNeeded,
   getAnthropicApiKey,
@@ -28,6 +34,11 @@ import {
   getVertexRegionForModel,
   isEnvTruthy,
 } from '../../utils/envUtils.js'
+import {
+  getOpenAIPath,
+  openAIResponseToBetaMessage,
+  toOpenAIChatRequest,
+} from './openaiCompat.js'
 
 /**
  * Environment variables for different client types:
@@ -85,6 +96,344 @@ function createStderrLogger(): ClientOptions['logger'] {
   }
 }
 
+type APIPromiseLike<T> = Promise<T> & {
+  asResponse(): Promise<Response>
+  withResponse(): Promise<{
+    data: T
+    response: Response
+    request_id: string | undefined
+  }>
+}
+
+type OpenAIStreamState = {
+  messageStarted: boolean
+  textBlockOpen: boolean
+  toolBlocks: Map<number, { anthropicIndex: number; open: boolean }>
+}
+
+function createAPIPromise<T>(
+  request: () => Promise<{ data: T; response: Response }>,
+): APIPromiseLike<T> {
+  const responsePromise = request()
+  const promise = responsePromise.then(result => result.data) as APIPromiseLike<T>
+  promise.asResponse = async () => (await responsePromise).response
+  promise.withResponse = async () => {
+    const result = await responsePromise
+    return {
+      data: result.data,
+      response: result.response,
+      request_id:
+        result.response.headers.get('request-id') ??
+        result.response.headers.get('x-request-id') ??
+        undefined,
+    }
+  }
+  return promise
+}
+
+function getOpenAIBaseUrl(): string {
+  return (
+    process.env.ANTHROPIC_BASE_URL ||
+    process.env.CLAUDE_CODE_API_BASE_URL ||
+    'https://api.openai.com'
+  )
+}
+
+async function parseOpenAIResponse<T>(response: Response): Promise<T> {
+  const text = await response.text()
+  if (!response.ok) {
+    throw new Error(
+      `OpenAI-compatible API request failed (${response.status}): ${text || response.statusText}`,
+    )
+  }
+  return JSON.parse(text) as T
+}
+
+function mapOpenAIFinishReason(finishReason?: string | null) {
+  switch (finishReason) {
+    case 'tool_calls':
+      return 'tool_use'
+    case 'length':
+      return 'max_tokens'
+    case 'content_filter':
+      return 'refusal'
+    case 'stop':
+      return 'end_turn'
+    default:
+      return null
+  }
+}
+
+function processOpenAIChunk(
+  chunk: {
+    id: string
+    model?: string
+    usage?: { prompt_tokens?: number; completion_tokens?: number }
+    choices?: Array<{
+      finish_reason?: string | null
+      delta?: {
+        content?: string | null
+        tool_calls?: Array<{
+          index?: number
+          id?: string
+          function?: { name?: string; arguments?: string }
+        }>
+      }
+    }>
+  },
+  state: OpenAIStreamState,
+): BetaRawMessageStreamEvent[] {
+  const choice = chunk.choices?.[0]
+  if (!choice) {
+    return []
+  }
+
+  const events: BetaRawMessageStreamEvent[] = []
+  if (!state.messageStarted) {
+    state.messageStarted = true
+    events.push({
+      type: 'message_start',
+      message: {
+        id: chunk.id,
+        type: 'message',
+        role: 'assistant',
+        model: chunk.model ?? '',
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+        },
+      } as BetaMessage,
+    })
+  }
+
+  if (choice.delta?.content) {
+    if (!state.textBlockOpen) {
+      events.push({
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'text',
+          text: '',
+        },
+      } as BetaRawMessageStreamEvent)
+      state.textBlockOpen = true
+    }
+    events.push({
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'text_delta',
+        text: choice.delta.content,
+      },
+    } as BetaRawMessageStreamEvent)
+  }
+
+  for (const toolCall of choice.delta?.tool_calls ?? []) {
+    if (state.textBlockOpen) {
+      events.push({
+        type: 'content_block_stop',
+        index: 0,
+      } as BetaRawMessageStreamEvent)
+      state.textBlockOpen = false
+    }
+
+    const toolIndex = toolCall.index ?? 0
+    const existing = state.toolBlocks.get(toolIndex)
+    const anthropicIndex = existing?.anthropicIndex ?? toolIndex + 1
+    if (!existing) {
+      state.toolBlocks.set(toolIndex, { anthropicIndex, open: true })
+      events.push({
+        type: 'content_block_start',
+        index: anthropicIndex,
+        content_block: {
+          type: 'tool_use',
+          id: toolCall.id ?? `tool_call_${toolIndex}`,
+          name: toolCall.function?.name ?? '',
+          input: {},
+        },
+      } as BetaRawMessageStreamEvent)
+    }
+
+    if (toolCall.function?.arguments) {
+      events.push({
+        type: 'content_block_delta',
+        index: anthropicIndex,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: toolCall.function.arguments,
+        },
+      } as BetaRawMessageStreamEvent)
+    }
+  }
+
+  if (choice.finish_reason) {
+    if (state.textBlockOpen) {
+      events.push({
+        type: 'content_block_stop',
+        index: 0,
+      } as BetaRawMessageStreamEvent)
+      state.textBlockOpen = false
+    }
+    for (const { anthropicIndex, open } of state.toolBlocks.values()) {
+      if (!open) continue
+      events.push({
+        type: 'content_block_stop',
+        index: anthropicIndex,
+      } as BetaRawMessageStreamEvent)
+    }
+    state.toolBlocks.clear()
+    events.push({
+      type: 'message_delta',
+      delta: {
+        stop_reason: mapOpenAIFinishReason(choice.finish_reason),
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens: chunk.usage?.prompt_tokens ?? 0,
+        output_tokens: chunk.usage?.completion_tokens ?? 0,
+      },
+    } as BetaRawMessageStreamEvent)
+    events.push({
+      type: 'message_stop',
+    } as BetaRawMessageStreamEvent)
+  }
+
+  return events
+}
+
+function createOpenAIStream(
+  response: Response,
+): Stream<BetaRawMessageStreamEvent> {
+  const controller = new AbortController()
+  const decoder = new TextDecoder()
+  const state: OpenAIStreamState = {
+    messageStarted: false,
+    textBlockOpen: false,
+    toolBlocks: new Map(),
+  }
+
+  const stream = {
+    controller,
+    async *[Symbol.asyncIterator]() {
+      const reader = response.body?.getReader()
+      if (!reader) {
+        return
+      }
+      let buffer = ''
+      try {
+        while (!controller.signal.aborted) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+
+          let separatorIndex = buffer.indexOf('\n\n')
+          while (separatorIndex !== -1) {
+            const frame = buffer.slice(0, separatorIndex)
+            buffer = buffer.slice(separatorIndex + 2)
+            const data = frame
+              .split('\n')
+              .filter(line => line.startsWith('data:'))
+              .map(line => line.slice(5).trim())
+              .join('\n')
+            if (!data) {
+              separatorIndex = buffer.indexOf('\n\n')
+              continue
+            }
+            if (data === '[DONE]') {
+              return
+            }
+            const chunk = JSON.parse(data)
+            for (const event of processOpenAIChunk(chunk, state)) {
+              yield event
+            }
+            separatorIndex = buffer.indexOf('\n\n')
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => {})
+        reader.releaseLock()
+      }
+    },
+  }
+
+  return stream as Stream<BetaRawMessageStreamEvent>
+}
+
+function createOpenAICompatibleClient({
+  apiKey,
+  defaultHeaders,
+  fetchImpl,
+}: {
+  apiKey?: string
+  defaultHeaders: Record<string, string>
+  fetchImpl: typeof fetch
+}): Anthropic {
+  const authToken = apiKey || getAnthropicApiKey()
+  const requestHeaders = {
+    ...defaultHeaders,
+    Authorization: `Bearer ${authToken}`,
+    'Content-Type': 'application/json',
+  }
+
+  async function postChatCompletions(
+    params: BetaMessageStreamParams,
+    options?: { signal?: AbortSignal },
+  ) {
+    const response = await fetchImpl(getOpenAIPath(getOpenAIBaseUrl()), {
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify(toOpenAIChatRequest(params)),
+      signal: options?.signal,
+    })
+    return response
+  }
+
+  return {
+    beta: {
+      messages: {
+        create: (
+          params: BetaMessageStreamParams,
+          options?: { signal?: AbortSignal },
+        ) =>
+          createAPIPromise(async () => {
+            const response = await postChatCompletions(params, options)
+            if (params.stream) {
+              return {
+                data: createOpenAIStream(response),
+                response,
+              }
+            }
+            const json = await parseOpenAIResponse<Parameters<
+              typeof openAIResponseToBetaMessage
+            >[0]>(response)
+            return {
+              data: openAIResponseToBetaMessage(json),
+              response,
+            }
+          }),
+        countTokens: async (params: BetaMessageStreamParams) => {
+          const response = await postChatCompletions(
+            { ...params, stream: false, max_tokens: 1 },
+            {},
+          )
+          const json = await parseOpenAIResponse<{
+            usage?: { prompt_tokens?: number }
+          }>(response)
+          return {
+            input_tokens: json.usage?.prompt_tokens ?? 0,
+          }
+        },
+      },
+    },
+    models: {
+      async *list() {},
+    },
+  } as unknown as Anthropic
+}
+
 export async function getAnthropicClient({
   apiKey,
   maxRetries,
@@ -98,6 +447,7 @@ export async function getAnthropicClient({
   fetchOverride?: ClientOptions['fetch']
   source?: string
 }): Promise<Anthropic> {
+  const provider = getAPIProvider()
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
   const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
@@ -128,6 +478,16 @@ export async function getAnthropicClient({
     defaultHeaders['x-anthropic-additional-protection'] = 'true'
   }
 
+  const resolvedFetch = buildFetch(fetchOverride, source)
+
+  if (provider === 'openai') {
+    return createOpenAICompatibleClient({
+      apiKey,
+      defaultHeaders,
+      fetchImpl: resolvedFetch as typeof fetch,
+    })
+  }
+
   logForDebugging('[API:auth] OAuth token check starting')
   await checkAndRefreshOAuthTokenIfNeeded()
   logForDebugging('[API:auth] OAuth token check complete')
@@ -135,8 +495,6 @@ export async function getAnthropicClient({
   if (!isClaudeAISubscriber()) {
     await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
   }
-
-  const resolvedFetch = buildFetch(fetchOverride, source)
 
   const ARGS = {
     defaultHeaders,

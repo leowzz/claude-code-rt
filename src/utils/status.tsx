@@ -244,7 +244,8 @@ export function buildAPIProviderProperties(): Property[] {
     const providerLabel = {
       bedrock: 'AWS Bedrock',
       vertex: 'Google Vertex AI',
-      foundry: 'Microsoft Foundry'
+      foundry: 'Microsoft Foundry',
+      openai: 'OpenAI-compatible API'
     }[apiProvider];
     properties.push({
       label: 'API provider',
@@ -318,6 +319,14 @@ export function buildAPIProviderProperties(): Property[] {
     if (isEnvTruthy(process.env.CLAUDE_CODE_SKIP_FOUNDRY_AUTH)) {
       properties.push({
         value: 'Microsoft Foundry auth skipped'
+      });
+    }
+  } else if (apiProvider === 'openai') {
+    const openaiBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    if (openaiBaseUrl) {
+      properties.push({
+        label: 'OpenAI base URL',
+        value: openaiBaseUrl
       });
     }
   }

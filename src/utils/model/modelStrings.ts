@@ -30,6 +30,23 @@ function getBuiltinModelStrings(provider: APIProvider): ModelStrings {
   return out
 }
 
+export function applyModelOverridesForTests(
+  ms: Record<string, string>,
+  overrides?: Record<string, string>,
+): Record<string, string> {
+  if (!overrides) {
+    return { ...ms }
+  }
+  const out = { ...ms }
+  for (const [canonicalId, override] of Object.entries(overrides)) {
+    const key = CANONICAL_ID_TO_KEY[canonicalId as CanonicalModelId]
+    if (key && override) {
+      out[key] = override
+    }
+  }
+  return out
+}
+
 async function getBedrockModelStrings(): Promise<ModelStrings> {
   const fallback = getBuiltinModelStrings('bedrock')
   let profiles: string[] | undefined
@@ -62,17 +79,7 @@ async function getBedrockModelStrings(): Promise<ModelStrings> {
  */
 function applyModelOverrides(ms: ModelStrings): ModelStrings {
   const overrides = getInitialSettings().modelOverrides
-  if (!overrides) {
-    return ms
-  }
-  const out = { ...ms }
-  for (const [canonicalId, override] of Object.entries(overrides)) {
-    const key = CANONICAL_ID_TO_KEY[canonicalId as CanonicalModelId]
-    if (key && override) {
-      out[key] = override
-    }
-  }
-  return out
+  return applyModelOverridesForTests(ms, overrides) as ModelStrings
 }
 
 /**
